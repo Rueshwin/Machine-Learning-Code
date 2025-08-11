@@ -1,0 +1,171 @@
+# Bandgap Prediction
+# Random forest
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from mp_api.client import MPRester
+from pymatgen.core import Structure
+from matminer.featurizers.structure import DensityFeatures, GlobalSymmetryFeatures
+import traceback
+
+# Function to log messages
+def log_message(message):
+    print(message)
+    with open("log.txt", "a") as log_file:
+        log_file.write(message + "\n")
+
+try:
+    # Step 1: Fetch data from Materials Project
+    API_KEY = "Your_API_KEY"
+    mpr = MPRester(API_KEY)
+
+    log_message("Fetching data from Materials Project...")
+    results = mpr.materials.summary.search(fields=["material_id", "band_gap", "structure", "formula_pretty"])
+    log_message(f"Fetched {len(results)} entries.")
+
+    # Step 2: Extract features from structures
+    def extract_features_from_structure(structure):
+        try:
+            return {
+                "mean_atomic_numbers": np.mean(structure.atomic_numbers),
+                "max_atomic_numbers": np.max(structure.atomic_numbers),
+                "min_atomic_numbers": np.min(structure.atomic_numbers),
+                "std_atomic_numbers": np.std(structure.atomic_numbers),
+                "a_parameters": structure.lattice.abc[0],
+                "b_parameters": structure.lattice.abc[1],
+                "c_parameters": structure.lattice.abc[2],
+                "alpha_parameters": structure.lattice.angles[0],
+                "beta_parameters": structure.lattice.angles[1],
+                "gamma_parameters": structure.lattice.angles[2],
+                "mean_distance_matrix": np.mean(structure.distance_matrix),
+                "max_distance_matrix": np.max(structure.distance_matrix),
+                "min_distance_matrix": np.min(structure.distance_matrix),
+                "std_distance_matrix": np.std(structure.distance_matrix),
+            }
+        except Exception as e:
+            log_message(f"Error extracting features: {e}")
+            return None
+
+    data = []
+    log_message("Extracting features...")
+
+    for r in results:
+        try:
+            structure = r.structure
+            band_gap = r.band_gap
+            formula = r.formula_pretty
+            features = extract_features_from_structure(structure)
+            if features and band_gap is not None:
+                data.append([formula] + list(features.values()) + [band_gap])
+        except Exception as e:
+            log_message(f"Error processing material: {e}\n{traceback.format_exc()}")
+
+    feature_columns = list(extract_features_from_structure(results[0].structure).keys())
+    columns = ["Formula"] + feature_columns + ["Band Gap"]
+    dataset_df = pd.DataFrame(data, columns=columns)
+
+    dataset_df.to_csv("band_gap_dataset.csv", index=False)
+    log_message("Dataset saved as 'band_gap_dataset.csv'")
+
+    # Step 2: Train Model on All Materials
+    log_message("Training model on all materials...")
+    X = dataset_df.drop(columns=["Formula", "Band Gap"])
+    y = dataset_df["Band Gap"]
+
+    scaler = StandardScaler().fit(X)
+    X_scaled = scaler.transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+    rf = RandomForestRegressor(n_estimators=400, max_depth=400, random_state=42)
+    rf.fit(X_train, y_train)
+    rf_predictions = rf.predict(X_test)
+
+    # Step 3: Save Predictions and Plot
+    output_df = pd.DataFrame({"True Band Gap": y_test, "Predicted Band Gap": rf_predictions})
+    output_df.to_csv("all_materials_predictions.csv", index=False)
+
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(x=y_test, y=rf_predictions)
+    plt.xlabel("True Band Gap")
+    plt.ylabel("Predicted Band Gap")
+    plt.title("Prediction vs True Band Gap (All Materials)")
+    plt.savefig("all_materials_plot.png")
+    log_message("Saved all materials plot.")
+
+    # Step 4: Filter Only Oxygen-Containing Compounds
+    log_message("Filtering oxygen-containing compounds...")
+    dataset_O = dataset_df[dataset_df["Formula"].str.contains("O")]
+    dataset_O.to_csv("oxygen_filtered_dataset.csv", index=False)
+
+    # Step 5: Retrain Model for Oxygen-Containing Compounds
+    log_message("Training model on oxygen-containing compounds...")
+    X_O = dataset_O.drop(columns=["Formula", "Band Gap"])
+    y_O = dataset_O["Band Gap"]
+
+    X_O_scaled = scaler.transform(X_O)
+    X_train_O, X_test_O, y_train_O, y_test_O = train_test_split(X_O_scaled, y_O, test_size=0.2, random_state=42)
+
+    rf_O = RandomForestRegressor(n_estimators=400, max_depth=400, random_state=42)
+    rf_O.fit(X_train_O, y_train_O)
+    rf_O_predictions = rf_O.predict(X_test_O)
+
+    # Step 6: Save Predictions and Plot
+    output_O_df = pd.DataFrame({"True Band Gap": y_test_O, "Predicted Band Gap": rf_O_predictions})
+    output_O_df.to_csv("oxygen_filtered_predictions.csv", index=False)
+
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(x=y_test_O, y=rf_O_predictions)
+    plt.xlabel("True Band Gap")
+    plt.ylabel("Predicted Band Gap")
+    plt.title("Prediction vs True Band Gap (Oxygen-Containing Compounds)")
+    plt.savefig("oxygen_filtered_plot.png")
+    log_message("Saved oxygen-filtered materials plot.")
+
+    # Compute overall model RMSE and R² before train-test split
+    rf_overall = RandomForestRegressor(n_estimators=400, max_depth=400, random_state=42)
+    rf_overall.fit(X_scaled, y)  # Train on full dataset
+    rf_overall_predictions = rf_overall.predict(X_scaled)  # Predict on full dataset
+
+    rmse_overall = np.sqrt(mean_squared_error(y, rf_overall_predictions))
+    r2_overall = r2_score(y, rf_overall_predictions)
+
+    log_message(f"Overall Model - RMSE: {rmse_overall:.3f}, R²: {r2_overall:.3f}")
+    print(f"Overall Model - RMSE: {rmse_overall:.3f}, R²: {r2_overall:.3f}")
+
+    # Step 7: Predict Band Gap for Given Structure
+    log_message("Predicting band gap for a given material...")
+    poscar_structure = Structure.from_str(
+        """
+1.0
+        0.XXXXXXXXXX        -0.XXXXXXXXXX         0.XXXXXXXXXX
+        0.XXXXXXXXXX         0.XXXXXXXXXX         0.XXXXXXXXXX
+        0.XXXXXXXXXX         0.XXXXXXXXXX         0.XXXXXXXXXX
+   Li    O
+    2    1
+Direct
+     0.XXXXXXXXX         0.XXXXXXXXX         0.XXXXXXXXX
+     0.XXXXXXXXX         0.XXXXXXXXX         0.XXXXXXXXX
+     0.XXXXXXXXX        -0.XXXXXXXXX         0.XXXXXXXXX""", fmt="poscar"
+    )
+
+    poscar_features = extract_features_from_structure(poscar_structure)
+    if poscar_features:
+        poscar_features_df = pd.DataFrame([poscar_features], columns=X.columns)
+        poscar_features_scaled = scaler.transform(poscar_features_df)
+        poscar_band_gap_prediction = rf_O.predict(poscar_features_scaled)
+        log_message(f"Predicted Band Gap for Given Material: {poscar_band_gap_prediction[0]:.3f} eV")
+
+        with open("given_material_band_gap.txt", "w") as f:
+            f.write(f"Predicted Band Gap: {poscar_band_gap_prediction[0]:.3f} eV\n")
+        log_message("Predicted band gap saved.")
+
+    log_message("Process completed.")
+
+except Exception as e:
+    log_message(f"Fatal Error: {e}\n{traceback.format_exc()}")
